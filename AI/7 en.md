@@ -1,11 +1,11 @@
 # Transformers Deep Dive
 
-## Why Transformers — The Problems with RNNs
+## Why Transformers — The Problems with RNNs | ✅
 
-## Self-Attention from Scratch
-## Multi-Head Attention
+## Self-Attention from Scratch | ✅
+## Multi-Head Attention | ✅
 
-## The Full Transformer — Encoder + Decoder
+## The Full Transformer — Encoder + Decoder | ✅
 
 <br/>
 
@@ -126,10 +126,11 @@ data quality: Not all tokens are equally useful.
 
 ## Build a Transformer from Scratch — The Capstone
 
-## Attention Variants — Sliding Window, Sparse, Differential
-
 <br/>
 <hr style="border: none; border-top: 2px dashed #999; height: 0;">
+
+## Attention Variants — Sliding Window, Sparse, Differential
+
 
 ### Sliding Window Attention (SWA)
 Instead of looking at the entire previous text, each token only looks at the most recent few tokens.
