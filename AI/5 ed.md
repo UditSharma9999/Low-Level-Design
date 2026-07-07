@@ -140,7 +140,7 @@ Instead of always using the correct previous word:
 <br/>
 <hr style="border: none; border-top: 2px dashed #999; height: 0;">
 
-## Attention Mechanism — The Breakthrough
+## Attention Mechanism — The Breakthrough | ✅
 
 
 <br/>
@@ -257,7 +257,7 @@ Beyond ROUGE:
 
 ## Subword Tokenization — BPE, WordPiece, Unigram, SentencePiece
 
-## Structured Outputs & Constrained Decoding
+## Structured Outputs & Constrained Decoding | ✅
 
 
 ## Natural Language Inference — Textual Entailment
