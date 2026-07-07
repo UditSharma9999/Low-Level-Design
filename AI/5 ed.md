@@ -1,5 +1,4 @@
 # Phase 06: Speech & Audio
-
 ## Bag of Words, TF-IDF, and Text Representation
 
 **Bag of Words (BoW)** throws away order. For each document, count how many times each vocabulary word appears. Vector length is the vocabulary size. Position i is the count of word i.
