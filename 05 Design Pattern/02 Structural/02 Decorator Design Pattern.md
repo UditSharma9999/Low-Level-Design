@@ -19,7 +19,7 @@ The first version works great. Then the requirements start growing:
 
 ### The Naive Approach: Subclassing for Every Combination
 
-![text16](\assets\16.png)
+![text16](../../assets/16.png)
 
 <details>
 <summary>Python</summary>
@@ -142,7 +142,7 @@ Two characteristics define the pattern:
 
 ## Class Diagram
 
-![text17](/assets/17.png)
+![text17](../../assets/17.png)
 
 
 - **Component (e.g., TextView)** : Declares the common interface that both the core object and all decorators implement.
