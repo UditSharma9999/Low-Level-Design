@@ -21,6 +21,10 @@ The first version works great. Then the requirements start growing:
 
 ![text16](../../assets/16.png)
 
+**The red nodes are combination subclasses that only exist because inheritance cannot mix and match behaviors.**
+
+
+
 <details>
 <summary>Python</summary>
 
@@ -136,7 +140,7 @@ The Decorator pattern is a structural pattern that attaches additional responsib
 
 Two characteristics define the pattern:
 
-1. *Same interface preservation*: Every decorator implements the same interface as the object it wraps. The client cannot tell whether it is talking to a plain object or a decorated one.
+1. **Same interface preservation**: Every decorator implements the same interface as the object it wraps. The client cannot tell whether it is talking to a plain object or a decorated one.
 
 2. **Dynamic composition**: Decorators can be stacked at runtime in any combination and any order. You choose what to add and when, not at compile time.
 
