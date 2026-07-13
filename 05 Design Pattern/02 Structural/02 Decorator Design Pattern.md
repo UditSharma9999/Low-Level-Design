@@ -144,6 +144,12 @@ Two characteristics define the pattern:
 
 2. **Dynamic composition**: Decorators can be stacked at runtime in any combination and any order. You choose what to add and when, not at compile time.
 
+## How it works?
+![text18](../../assets/18.png)
+
+
+
+
 ## Class Diagram
 
 ![text17](../../assets/17.png)
