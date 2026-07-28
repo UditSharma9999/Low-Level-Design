@@ -786,3 +786,5 @@ The five main query rewrite patterns used in production RAG systems are:
 5. **Entity Grounding** – Expands acronyms, abbreviations, or jargon into their full canonical forms (e.g., *"FNMA-2024"* → *"Federal National Mortgage Association (FNMA) 2024 program"*), improving retrieval from formally written documents. 
 
 > A key lesson is that query rewriting must preserve the user's intent. Overly aggressive rewriting can change the meaning of a query—for example, replacing a request to **cite exact statutory language** with a request for a **general explanation**. Because of this, rewrite prompts are treated like production code: they are version-controlled, tested on golden datasets, monitored, and rolled back if they reduce retrieval quality.
+
+
