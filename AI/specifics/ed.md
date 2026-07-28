@@ -658,3 +658,131 @@ Another issue is compliance. Some industries, such as healthcare or finance, req
 
 Because of these limitations, a single shared index is a good choice for small systems because it is simple, cheap, and easy to maintain. As the product grows to dozens or hundreds of tenants, or when tenant sizes vary significantly or compliance requirements become stricter, companies typically move to **namespaces** or **separate indexes**. These approaches improve search quality, reduce latency for small tenants, and provide stronger data isolation.
 
+### When building a RAG system for multiple customers (called tenants), there isn't one perfect way to store everyone's vectors.
+
+There are three standard multi-tenant patterns:
+
+**Pattern 1 – Metadata Filtering (One Shared Index)**
+
+All tenants share one vector index. Every document stores metadata such as tenant_id, and whenever a user searches, the query includes a filter like "only return documents where tenant_id = Company_A." Since there is only one HNSW graph, one ingestion pipeline, and one index to monitor, it is very easy to operate and costs the least. This works well when you have fewer than about 50 tenants.
+
+the problem is how HNSW actually searches. HNSW first searches across the entire graph and finds the nearest vectors. Only after those candidates are found does it apply the tenant filter. If one tenant owns only a tiny fraction of the entire corpus, very few of its documents appear among the nearest candidates. After filtering out documents belonging to other tenants, there may be very few—or even zero—results left. This causes retrieval quality (recall) to drop significantly for small tenants.
+
+A common fix is increasing `efSearch` so HNSW explores many more candidates. While this improves recall for small tenants, it makes every search much slower. 
+
+
+
+**Pattern 2 – Namespaces (Logical Partitions)**
+
+Namespaces are the middle ground between one shared index and completely separate indexes. Instead of putting every tenant into one shared graph, the vector database creates logical partitions, called namespaces. Each namespace behaves like a separate section inside the same index. When a query comes in, it searches only inside that tenant's namespace, so HNSW never searches documents belonging to other tenants. This means recall does not degrade the way it does with metadata filtering.
+
+
+Namespaces are attractive because they provide much better isolation while still being cheaper than creating an entirely separate index for every tenant. Operationally, you still manage one overall index, one monitoring system, and one infrastructure setup. Routing a request simply means specifying the correct namespace.
+
+However, namespaces are not perfect. Their isolation depends on the vector database provider. Some providers truly create separate ANN graphs for each namespace, while others simply attach a namespace label internally but still use a shared graph.
+
+
+Namespaces also limit customization. Usually, settings such as efSearch, replica count, and performance tuning are configured for the whole index rather than individually for each namespace. Deleting all documents for one tenant is easier than with metadata filtering but still not as clean or fast as deleting an entire dedicated index.
+
+Namespaces work well for hundreds of tenants, especially when document sizes are fairly similar. They begin to struggle when one tenant has tens of millions of documents while another has only a few thousand, or when regulations require physical rather than logical isolation.
+
+
+**Pattern 3 – Dedicated Index per Tenant**
+
+
+This provides the strongest isolation. Instead of sharing anything, every tenant gets their own vector index with its own HNSW graph, memory allocation, replicas, monitoring, and configuration.
+
+
+This has many advantages. Retrieval quality is excellent because each search only looks through that tenant's own documents. You can tune HNSW settings such as efSearch differently for each tenant depending on their workload. Deleting a tenant's data becomes extremely simple because you can delete the entire index. Auditing and compliance also become much easier because there is a clear physical separation between customers.
+
+The downside is cost and operational complexity. Every new tenant requires another index to build, monitor, back up, maintain, and scale. With 10 tenants this is manageable. With 100 tenants it becomes a significant operational effort. With 1000 tenants it is impossible to manage manually. At that point you need an automation system that automatically creates indexes when new customers sign up, scales them as data grows, deletes inactive ones, performs backups, and handles maintenance without human intervention.
+
+Dedicated indexes also waste resources for tiny tenants. Creating a complete HNSW index for a customer with only a few hundred documents is inefficient because the overhead of maintaining the index is much larger than the actual data.
+
+
+#### The Production Solution: Tiered Tenancy
+
+In real production systems, companies rarely choose only one of these patterns. Instead, they use tiered tenancy, where different tenants use different architectures based on their needs.
+
+- Small customers with very little data share a metadata-filtered index, since it is the cheapest option.
+
+- Medium-sized customers move into namespaces, which provide better retrieval quality without the high cost of separate indexes.
+
+- Large enterprise customers—or customers with strict compliance requirements like SOC 2, HIPAA, or financial regulations—receive their own dedicated index for maximum isolation, performance, and auditability.
+
+
+## Sharding
+
+split the database across multiple machines
+
+
+
+
+### Pattern 1: Consistent Hashing (Simple and Most Common)
+
+The easiest way to shard is by using consistent hashing. Every vector has a unique ID, and a hash function decides which shard should store that vector. During writes, the system calculates the hash and sends the vector to exactly one shard, making writes very fast and scalable.
+
+When a user searches, however, the query is sent to every shard because the system doesn't know which shard contains the nearest vectors. Each shard performs its own HNSW search and returns its best candidates. A coordinator service then merges all these local results and produces the final global Top-K results.
+
+The biggest advantage is that it is very simple, scales well for writes, and doesn't create hot spots where one server receives much more traffic than others. The downside is that every query must contact every shard, so if you have 10 shards, all 10 perform work. Also, the final response is limited by the slowest shard. To maintain high recall, each shard usually returns more than K results (often K × √number_of_shards) so the coordinator has enough candidates to find the true global top-K.
+
+
+### Pattern 2: Router + Leaf Architecture
+
+This is an improvement over simple consistent hashing. Instead of clients talking directly to every shard, there is a router service sitting in front.
+
+The router knows which shards exist and forwards queries to the appropriate leaf nodes. Often it still broadcasts to all shards, but now it can apply routing rules before doing so. For example, if the query belongs to Tenant A, the router may only contact the shards that contain Tenant A's documents instead of every shard.
+
+After all selected shards return their candidates, the router merges them into the final answer.
+
+The benefits are better routing flexibility, tenant-aware filtering, and easier management. This is actually how many managed vector databases work internally. The drawback is that query cost still increases with the number of shards because multiple shards are searched in parallel.
+
+### Pattern 3: Learned Partitioning (Content-Based Sharding)
+
+This is the most advanced approach used for very large systems.
+
+Instead of distributing vectors randomly using hashes, the system first groups similar vectors together using clustering algorithms such as k-means. Each cluster is assigned to a shard.
+
+When a query arrives, the router first determines which clusters are closest to the query vector. Instead of searching every shard, it only searches the 2–5 shards that contain the most relevant clusters.
+
+This dramatically reduces query cost because searching 5 shards is much cheaper than searching 100. However, it introduces new challenges. If a query lies near the boundary between clusters, the nearest vector might actually be stored in a different shard, reducing recall slightly. Also, adding new shards becomes difficult because many vectors must be reclustered and moved, making rebalancing a large offline operation.
+
+
+### Replication
+
+1. **Synchronous Replication**: A write is considered successful only after every replica has acknowledged it.
+
+2. **Asynchronous Replication** : The primary replica accepts the write immediately. Other replicas receive the update a few seconds later.
+
+
+> For a production B2B RAG system with hundreds of customers, the best approach is tiered tenancy. Small customers share a metadata-filtered index because it's inexpensive. Medium-sized customers are placed into namespaces for better retrieval quality. Large or compliance-sensitive customers receive dedicated indexes on their own shards. The system uses async replication for most workloads because it provides high performance, while compliance-critical tenants may use sync replication. A **CDC (Change Data Capture)** pipeline keeps documents searchable within seconds or minutes instead of waiting for nightly batch jobs. When changing embedding models, the system follows the **dual-index migration pattern**, allowing a safe rollout and easy rollback. Deletions are handled according to compliance requirements, ensuring physical removal of vectors within the required SLA. The key lesson is that sharding, replication, freshness, migration, and deletion should all be designed before the system reaches massive scale, because adding them later under production load is significantly more difficult.
+
+---
+
+<br/>
+
+In a production RAG system, the **user's original query is usually not the best input for retrieval** because it looks very different from the documents stored in the knowledge base. Users naturally type **short, informal, and incomplete queries**, such as **"flight expenses," "how do I expense a flight,"** or **"can't login w/ my email."** These queries often contain abbreviations, contractions, missing words, or everyday language. On the other hand, the indexed documents are written in **formal, structured language**, with titles like **"Reimbursement Procedures for Air Travel under the Corporate Travel Policy v3.2"** or **"Authentication Troubleshooting for SSO-Federated Accounts."** Although both describe the same topic, they use very different vocabulary, sentence structure, and writing style. 
+
+This creates a **vocabulary mismatch**. Since embedding models (bi-encoders) are designed to place semantically similar text close together in embedding space, a short informal query may not end up close to the formal document that actually contains the answer. As a result, the vector search may retrieve only partially relevant documents or completely miss the best one. This silent retrieval failure can reduce **Recall@10 by around 5–20 percentage points**, meaning the correct document was never retrieved in the first place. The LLM then generates its answer using less relevant context, increasing the chances of hallucination or incorrect responses. 
+
+To solve this problem, production systems perform **pre-retrieval transformation** before embedding the query. Instead of directly embedding what the user typed, the system first sends the query to a small, inexpensive LLM that rewrites it into language that more closely resembles the indexed documents. For example, **"can't login w/ my email"** may become **"Authentication troubleshooting for email-based single sign-on (SSO) login failures."** The rewritten query is much closer to the wording used in documentation, making it easier for the embedding model to retrieve the correct chunks. 
+
+Many production systems go beyond simple rewriting. They run three techniques in parallel: **query rewriting**, **HyDE (Hypothetical Document Embeddings)**, which generates a hypothetical answer-like document for retrieval, and **multi-query expansion**, which creates several alternative versions of the same question. Each version performs its own vector search, and all retrieved candidates are combined before reranking. Running these stages in parallel improves retrieval quality without adding as much latency as executing them one after another. The candidate documents returned from all these searches are merged into one pool using **Reciprocal Rank Fusion (RRF)**, which combines rankings from multiple searches. Finally, the fused top candidates (for example, the top 50) are passed to a cross-encoder reranker, which carefully scores each query-document pair and selects the most relevant documents for the LLM. This gives much better retrieval quality than relying on a single query.
+
+The cost of query rewriting is very small. A rewrite using a mini-tier LLM typically costs around **$0.0001 per query**, which is almost negligible compared to the **$0.005–$0.05** spent on the final answer generation. Because this inexpensive step can significantly improve retrieval quality, it usually provides an excellent return on investment. 
+
+However, rewriting itself becomes a **production component**, not just a simple prompt. A poorly designed rewrite prompt can accidentally change important entities or introduce incorrect information, silently reducing retrieval quality for every user. Therefore, the rewrite prompt is treated like production code: it is version-controlled, evaluated against a golden test set, monitored with dashboards, and can be rolled back quickly if a new version performs worse. In mature RAG systems, query rewriting is continuously tested and improved because even small regressions can quietly affect retrieval accuracy across the entire application. 
+
+The five main query rewrite patterns used in production RAG systems are: 
+
+1. **Paraphrasing** – Rewrites short or incomplete queries into clear, natural-language questions that better match document wording (e.g., *"flight expenses"* → *"How do I get reimbursed for airfare on a business trip?"*). 
+
+2. **Expansion (Synonym Injection)** – Adds related terms and synonyms to reduce vocabulary mismatch (e.g., *"cancel"* → *"cancel, terminate, end, unsubscribe"*). 
+
+3. **Normalization** – Converts informal language, abbreviations, and contractions into standard, formal text (e.g., *"can't login w/ my email"* → *"unable to log in using email address"*). 
+
+4. **Decomposition** – Breaks a complex, multi-part question into several simpler sub-queries, retrieves documents for each, and combines the results for better coverage. 
+
+5. **Entity Grounding** – Expands acronyms, abbreviations, or jargon into their full canonical forms (e.g., *"FNMA-2024"* → *"Federal National Mortgage Association (FNMA) 2024 program"*), improving retrieval from formally written documents. 
+
+> A key lesson is that query rewriting must preserve the user's intent. Overly aggressive rewriting can change the meaning of a query—for example, replacing a request to **cite exact statutory language** with a request for a **general explanation**. Because of this, rewrite prompts are treated like production code: they are version-controlled, tested on golden datasets, monitored, and rolled back if they reduce retrieval quality.
