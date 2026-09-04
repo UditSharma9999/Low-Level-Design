@@ -759,15 +759,18 @@ This dramatically reduces query cost because searching 5 shards is much cheaper 
 
 ---
 
+## The Retrieval Pipeline
+
+
 <br/>
 
 In a production RAG system, the **user's original query is usually not the best input for retrieval** because it looks very different from the documents stored in the knowledge base. Users naturally type **short, informal, and incomplete queries**, such as **"flight expenses," "how do I expense a flight,"** or **"can't login w/ my email."** These queries often contain abbreviations, contractions, missing words, or everyday language. On the other hand, the indexed documents are written in **formal, structured language**, with titles like **"Reimbursement Procedures for Air Travel under the Corporate Travel Policy v3.2"** or **"Authentication Troubleshooting for SSO-Federated Accounts."** Although both describe the same topic, they use very different vocabulary, sentence structure, and writing style. 
 
-This creates a **vocabulary mismatch**. Since embedding models (bi-encoders) are designed to place semantically similar text close together in embedding space, a short informal query may not end up close to the formal document that actually contains the answer. As a result, the vector search may retrieve only partially relevant documents or completely miss the best one. This silent retrieval failure can reduce **Recall@10 by around 5–20 percentage points**, meaning the correct document was never retrieved in the first place. The LLM then generates its answer using less relevant context, increasing the chances of hallucination or incorrect responses. 
+This creates a **`vocabulary mismatch`**. Since embedding models (bi-encoders) are designed to place semantically similar text close together in embedding space, a short informal query may not end up close to the formal document that actually contains the answer. As a result, the vector search may retrieve only partially relevant documents or completely miss the best one. This silent retrieval failure can reduce **Recall@10 by around 5–20 percentage points**, meaning the correct document was never retrieved in the first place. The LLM then generates its answer using less relevant context, increasing the chances of hallucination or incorrect responses. 
 
 To solve this problem, production systems perform **pre-retrieval transformation** before embedding the query. Instead of directly embedding what the user typed, the system first sends the query to a small, inexpensive LLM that rewrites it into language that more closely resembles the indexed documents. For example, **"can't login w/ my email"** may become **"Authentication troubleshooting for email-based single sign-on (SSO) login failures."** The rewritten query is much closer to the wording used in documentation, making it easier for the embedding model to retrieve the correct chunks. 
 
-Many production systems go beyond simple rewriting. They run three techniques in parallel: **query rewriting**, **HyDE (Hypothetical Document Embeddings)**, which generates a hypothetical answer-like document for retrieval, and **multi-query expansion**, which creates several alternative versions of the same question. Each version performs its own vector search, and all retrieved candidates are combined before reranking. Running these stages in parallel improves retrieval quality without adding as much latency as executing them one after another. The candidate documents returned from all these searches are merged into one pool using **Reciprocal Rank Fusion (RRF)**, which combines rankings from multiple searches. Finally, the fused top candidates (for example, the top 50) are passed to a cross-encoder reranker, which carefully scores each query-document pair and selects the most relevant documents for the LLM. This gives much better retrieval quality than relying on a single query.
+Many production systems go beyond simple rewriting. They run three techniques in parallel: **`query rewriting`**, **`HyDE (Hypothetical Document Embeddings)`**, which generates a hypothetical answer-like document for retrieval, and **`multi-query expansion`**, which creates several alternative versions of the same question. Each version performs its own vector search, and all retrieved candidates are combined before reranking. Running these stages in parallel improves retrieval quality without adding as much latency as executing them one after another. The candidate documents returned from all these searches are merged into one pool using **Reciprocal Rank Fusion (RRF)**, which combines rankings from multiple searches. Finally, the fused top candidates (for example, the top 50) are passed to a cross-encoder reranker, which carefully scores each query-document pair and selects the most relevant documents for the LLM. This gives much better retrieval quality than relying on a single query.
 
 The cost of query rewriting is very small. A rewrite using a mini-tier LLM typically costs around **$0.0001 per query**, which is almost negligible compared to the **$0.005–$0.05** spent on the final answer generation. Because this inexpensive step can significantly improve retrieval quality, it usually provides an excellent return on investment. 
 
@@ -787,4 +790,182 @@ The five main query rewrite patterns used in production RAG systems are:
 
 > A key lesson is that query rewriting must preserve the user's intent. Overly aggressive rewriting can change the meaning of a query—for example, replacing a request to **cite exact statutory language** with a request for a **general explanation**. Because of this, rewrite prompts are treated like production code: they are version-controlled, tested on golden datasets, monitored, and rolled back if they reduce retrieval quality.
 
+
+
+### BM25, Dense, and RRF — Why Hybrid Wins
+
+### 1. Why Pure Dense Retrieval Quietly Fails
+we convert the user's query into an embedding and then search for documents whose embeddings are closest to the query embedding. This is called **dense retrieval**. It is very good at understanding the meaning of text. However, dense retrieval has an important weakness: it is not particularly good at exact matching. Embeddings compress an entire piece of text into a fixed-size vector, so some information is inevitably lost during this compression.
+
+This failure becomes particularly important for brand names, product SKUs, IDs, rare technical terminology, acronyms, very short queries, and some negation-heavy queries.
+
+The important mental model is that a **bi-encoder is doing lossy compression**. A bi-encoder independently converts the query and each document into vectors. Once the text is compressed into a vector, you compare the vectors using something such as cosine similarity. Cosine similarity basically answers, **"Are these texts semantically related?"** It does not necessarily answer, **"Do these texts contain exactly the same important string?"** This distinction is why pure dense retrieval can silently fail even when the embedding model itself is very good.
+
+### 2. Why BM25 Is Needed
+
+**BM25**, or Best Match 25, is a traditional search/retrieval algorithm. It comes from the family of keyword-based retrieval techniques such as TF-IDF. Instead of converting text into semantic vectors, BM25 builds an **inverted index** over the words in your documents. When the user searches for a word, BM25 can very efficiently identify documents containing that word and calculate how important that occurrence is. This makes BM25 almost the opposite of dense retrieval: dense retrieval is strong at understanding meaning, while BM25 is strong at recognizing exact words.
+
+BM25 considers three major things. 
+- Term frequency
+- inverse document frequency
+- document length normalization (which prevents long documents from automatically winning simply because they contain more words)
+
+BM25 is sparse retrieval, while embeddings are dense retrieval.
+
+### What Is Hybrid Retrieval?
+
+Typically BM25 + dense vector retrieval, for the same query. The idea is that you don't want to force one algorithm to solve every type of query.  Both retrieval systems run independently and produce ranked lists of candidate documents. You then combine those lists before sending the candidates to the next stage.
+
+### Why Can't We Just Add BM25 Score and Dense Score?
+
+After running BM25 and dense retrieval, you have two ranked lists. A tempting approach is to take the BM25 score and dense similarity score and simply add them together. The problem is that these scores live on different scales. Dense retrieval might use cosine similarity where values commonly fall into some bounded range, while BM25 scores are not bounded in the same way and depend heavily on the corpus and query.
+
+**RRF (Reciprocal Rank Fusion)** is a simple method for combining multiple ranked lists without comparing their raw scores. Instead of asking, "What was the BM25 score and what was the embedding score?", RRF asks, "What position did this document achieve in each ranking?" A document that ranks highly in both systems gets a strong combined score. A document that appears in only one ranking can still be competitive, but it usually won't dominate a document that both retrieval systems agree is relevant.
+
+The important insight is that **RRF doesn't care about the numerical score produced by BM25 or the embedding model**. It only cares about ranking position. This makes the method robust because you don't have to solve the difficult problem of putting BM25 and cosine similarity onto the same numerical scale.
+
+$$
+\operatorname{RRF}(d) = \sum_{r} \frac{1}{k + \operatorname{rank}_{r}(d)}
+$$
+
+The **k** value is called a **smoothing constant**. It prevents very high-ranked documents from completely dominating the calculation.
+
+### Why Retrieval K Should Be 50–100 Instead of 10
+
+A beginner might say:
+
+    "The user only needs 10 documents, so I'll retrieve top-10."
+
+But that is dangerous. The vector database isn't supposed to be the final decision-maker. It is supposed to create a candidate pool for the reranker. Therefore, you should generally retrieve more candidates than you eventually put into the LLM context.
+
+### Understanding Recall@K
+
+Recall@K asks: "Out of all the relevant documents, how many did my system successfully retrieve within the first K results?"
+
+Suppose there are 10 relevant documents for a query. If your retrieval system returns 50 candidates and contains 9 of those 10 relevant documents, your recall@50 is 90%.
+
+Now imagine the reranker is excellent and can correctly identify the best documents from those 50 candidates. Great.
+
+But if you retrieve only 10 candidates and only 7 relevant documents are present, then the remaining three are gone. No reranker can recover them.
+
+### Why Retrieval K Increases With Corpus Size
+
+As your knowledge base becomes larger, there are more documents that are near-matches. These are documents that look semantically similar to the query but aren't actually the best answer.Therefore, you often need to increase retrieval K as your corpus grows.
+
+### Cross-Encoder Reranking — Precision On Top of Recall
+
+**A reranker is a model that takes the documents already retrieved by a search system and re-orders them from most relevant to least relevant.**
+
+
+
+A bi-encoder is what a vector database typically uses for retrieval. It converts the query and every document into vectors separately and then compares them using cosine similarity. The important advantage is speed: document embeddings are calculated once when the documents are indexed, so during a user query you only need to embed the query and perform an ANN search. However, the limitation is that the model never sees the query and document together. It creates a fixed-length vector representation of each and hopes that similar meanings will be close together. Because of this compression, two pieces of text can appear similar in vector space even when one is not actually the best answer.
+
+A cross-encoder works differently. Instead of embedding the query and document independently, it takes the query + document together as one input and runs a transformer over the combined text. Because the model can directly look at the relationship between the query and the document, it can identify much more detailed relevance. It produces a relevance score for that particular pair. The problem is that this computation cannot be precomputed: every query-document pair requires a new model inference at query time.
+
+- **Bi-encoder** = fast first filter: It converts the query and documents into vectors separately. Since document vectors are already stored, it can quickly find the closest documents using ANN. Fast, but less precise.
+
+- **Cross-encoder** = careful final judge: It takes the query and each candidate document together and asks, “How relevant is this document to this exact query?” This gives better relevance, but it is slower because it must run for every query-document pair.
+
+**"If the cross-encoder is more accurate, why don't we just use it?"** The problem is that accuracy isn't the only consideration. You also have to consider computation and latency. Running a powerful model against the entire corpus for every query is too expensive. Therefore, the bi-encoder is necessary because it performs the cheap broad search, and the cross-encoder is necessary because it performs the expensive precise ranking.
+
+
+
+Adding a cross-encoder reranker generally improves retrieval quality.
+
+| Reranking is especially valuable | Reranking is less valuable |
+|---|---|
+| Exact document retrieval is critical | Corpus is small (<10,000 chunks) |
+| Precision-sensitive domains: legal, medical, financial, technical | Bi-encoder already performs extremely well (95%+ top-1 accuracy) |
+| Many similar or duplicate documents | Application requires extremely low latency (single-digit milliseconds) |
+| Better ordering of RAG context is important | Extra latency and computation aren't justified |
+| “A similar answer isn't good enough; I need the correct one.” | Simple retrieval already meets accuracy requirements |
+| Accuracy matters more than latency/cost | Latency and cost matter more than marginal accuracy gains |
+
+
+### Main reranker options
+There are several choices, and there is no single “best” reranker. The choice depends on quality, cost, latency, infrastructure, and the type of data.
+
+- **Cohere Rerank**: Managed API; easiest to deploy.
+- **bge-reranker-large**: Open-source and self-hosted; good if you already have GPUs.
+- **mxbai-rerank-large-v1**: Self-hosted; useful for long-context and code-heavy data.
+- **bge-reranker-v2-m3**: Designed for multilingual retrieval.
+- **ColBERT**: Uses late interaction and sits between a bi-encoder and cross-encoder in terms of architecture and cost.
+
+A reranker is useful if it measurably improves retrieval quality enough to justify its extra cost and latency. For example, in the experiment, bi-encoder retrieval had 78% recall@10, while adding a Cohere reranker increased it to 91%—a 13 percentage-point improvement. Although reranking added about 150 ms latency and extra cost, it reduced wrong answers and support escalations, so it was worth it. However, on another FAQ surface, the improvement was only 2pp, so reranking was disabled there. This shows that you should test reranking separately for each use case rather than assuming it is always needed.
+
+The basic idea is: retrieve many documents cheaply, rerank the best candidates more carefully, then send only the most relevant ones to the LLM. For example, from 1 million documents, the bi-encoder might select 100 candidates, the cross-encoder reranks them down to 20–30, and context packing finally sends about 10 to the LLM. 
+
+
+### Context Window Packing — Lost in the Middle, Citations, Summaries
+
+
+### Why isn't “concatenate the top-10 in rank order” good enough?
+
+After retrieval and reranking, suppose the reranker gives you 10 chunks in order of relevance: chunk-1 is the most relevant and chunk-10 is the least relevant. A simple approach is to put them into the prompt in exactly that order. The problem is that an LLM does not use every part of a long context equally well. This is called the **lost-in-the-middle effect**. Information at the beginning and end of a long context is generally recalled more reliably, while information placed in the middle is recalled less reliably. Therefore, even though the reranker selected the correct chunks.
+
+### Lost-in-the-middle effect
+
+The lost-in-the-middle effect means that an LLM's ability to recall and use information changes depending on where that information appears in the context. The beginning and end of the context receive stronger effective attention, while information in the middle can receive weaker attention. The effect becomes worse as the context gets longer. The text also emphasizes that this is not simply a decoder-only model problem; it has been observed in both decoder-only and encoder-decoder model families.
+
+The text describes this behavior as a U-shaped accuracy curve. For a 10-chunk context, accuracy can be around 85% when the relevant chunk is first, fall to around 55% in the middle, and recover to around 80% near the end. This means that two identical pieces of information can have different usefulness simply because one is placed near the beginning/end and the other is buried in the middle.
+
+### Named packing patterns
+
+Four packing patterns, moving from the simplest approach to more sophisticated approaches. The choice mainly depends on how many chunks you have retrieved.
+
+1. **Naive rank order**
+
+    Naive rank order means putting the chunks exactly in reranker order:
+
+    `chunk-1, chunk-2, chunk-3, ..., chunk-10`
+
+    This is the simplest and most natural approach, but it does not account for the lost-in-the-middle effect.
+
+<br/>
+
+2. **U-shaped order**
+
+    The U-shaped packing strategy changes the order so that the highest-ranked chunks are placed at the positions where the model's attention is strongest. For 10 chunks, the example order is:
+
+    `1, 3, 5, 7, 9, 10, 8, 6, 4, 2`
+
+    Here, chunk-1 goes at the absolute beginning and chunk-2 goes at the absolute end. Chunk-3 goes second from the beginning and chunk-4 goes second from the end. This continues until the middle contains the lower-priority chunks. 
+
+    This gives an empirical 3–8 percentage-point lift in faithfulness in evaluations and is essentially a free optimization because it is just a sorting/reordering operation.
+
+<br/>
+
+3. **Structured packing with section markers**
+
+    Structured packing goes one step further by putting each retrieved chunk inside a clearly defined structure containing metadata. For example, a chunk can have a document ID, source, page number, and update date. The important idea is that the LLM can clearly see where one document/chunk begins and ends instead of receiving a large block of unstructured text.
+
+    These markers provide three main benefits. 
+    - First, they treat each chunk as an atomic unit, reducing accidental mixing of information between chunks. 
+    
+    - Second, they expose a document ID, which allows the model to cite the source of a claim. 
+    
+    - Third, metadata such as source, page, and updated date gives the model information that can help it reason about freshness and source authority. The text estimates roughly 5 extra tokens per chunk, making this a very small cost compared with the benefits for citation, debugging, and observability.
+
+<br/>
+
+4. **Map-reduce for very large retrieved sets**
+
+    When the number of retrieved chunks becomes very large, putting everything into one prompt can become expensive or exceed the comfortable context budget. Instead of sending all chunks together, you divide them into several batches. The LLM processes each batch separately and extracts the relevant snippets. Then another step synthesizes those extracted snippets into the final answer.
+
+    The advantage is that the prompt size for each individual call stays controlled. The disadvantage is that multiple LLM calls add latency.
+
+### Which packing strategy should you use?
+
+- For 5 or fewer chunks, rank order can be sufficient, but structured markers and citation IDs should still be used. 
+
+- For 5–15 chunks, use U-shaped ordering along with structured markers and citation IDs. 
+
+- For 15–30 chunks, use U-shaped ordering and summarize the middle/relevant chunks before packing. 
+
+- For 30+ chunks, use map-reduce, where individual batches are processed and then synthesized.
+
+
+### Prompt caching
+
+Prompt caching is another cost optimization mentioned in the text. If parts of the prompt are repeated across many queries, such as the system prompt and structured-marker boilerplate, some providers can cache that repeated prefix and charge less for the cached portion. The text gives a potential saving of around 50–90% on the cached portion.
 
