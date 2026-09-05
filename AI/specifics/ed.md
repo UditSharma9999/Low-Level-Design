@@ -969,3 +969,76 @@ Four packing patterns, moving from the simplest approach to more sophisticated a
 
 Prompt caching is another cost optimization mentioned in the text. If parts of the prompt are repeated across many queries, such as the system prompt and structured-marker boilerplate, some providers can cache that repeated prefix and charge less for the cached portion. The text gives a potential saving of around 50–90% on the cached portion.
 
+
+## Evaluation
+
+### Why GenAI Eval Is Different 
+
+### Difference 1 — Outputs are text, not labels
+
+In classic ML, the ground truth is often something that was directly logged. In RAG, the ground truth may be a human-written reference answer, but creating such references is expensive and there may be multiple valid ways of answering the same question.
+
+> Imp 💡  
+> The older approach was to use metrics such as **BLEU**, **ROUGE**, and **METEOR**, which primarily depend on textual overlap. These metrics have a major problem for RAG: a correct answer can use different wording and therefore receive a poor score, while a fluent but incorrect answer can share many words with the reference and receive a good score. The text therefore says these should not be used as primary metrics in a serious 2026 RAG evaluation stack.
+
+
+<h4> <bold>  👉 RAGAS four-cell grid </bold> </h4>
+
+The text presents the RAGAS **four-cell grid** as the replacement for relying on simple text-overlap metrics. It separates the evaluation into four dimensions: **faithfulness** and **answer relevance** for generation, and **context precision** and **context recall** for retrieval. This decomposition is useful because each cell focuses on a different possible failure. Instead of getting one vague quality number, you can identify whether the problem is with the generated answer or with the retrieved context.
+
+The basic idea is that RAG evaluation needs to examine both sides of the system. The generator could produce a bad answer even with good retrieval, or the retriever could fail to retrieve the information required to answer the question. The four-cell grid helps separate these situations.
+
+### Difference 2 — Equivalence is a judgment call
+
+Even when you have a reference answer, determining whether the generated answer means the same thing is not straightforward. Embedding cosine similarity can be too loose because a wrong answer can still be semantically close to the correct answer. String overlap has the opposite problem: it can be too strict because a correct answer may use completely different wording. Therefore, neither approach completely solves semantic equivalence for generated answers.
+
+Solution is LLM-as-judge. Another LLM is given a rubric and asked to compare the model's answer with the reference and judge whether they are equivalent. However, this introduces a new problem. becomes something that also needs to be evaluated rather than being a completely fixed measurement.
+
+
+Three implications problem:
+- **Metric drift**: If you change or upgrade the judge model, the reported faithfulness score can change even though the actual RAG system being evaluated has not changed.
+
+- **Judge bias**
+
+- **Judge non-determinism**: Same evaluation can produce slightly different scores when run multiple times.
+
+
+### Difference 3 — Worst failures are invisible to aggregate metrics
+
+One of the most important RAG evaluation problems is that an answer can look excellent while being wrong in an important way.
+
+`Example`: The user asks about the 2025 policy, but RAG accidentally retrieves a 2022 policy. The AI reads the 2022 document and gives a clear, confident, correct-looking answer based on that document. So, the answer may score well for relevance (it answers the question) and faithfulness (it matches the retrieved document), but it is still wrong for the user because the document is outdated.
+
+
+
+> 💡 Interview Tip     
+> The fastest way to sound junior on the eval row is to name BLEU or ROUGE as your primary metric. The fastest way to sound senior is to name BLEU and ROUGE as the deprecated metrics you don't use: "BLEU was invented for machine translation in 2002 and even there it's been deprecated as a primary metric; for RAG it rewards parroting and penalizes correct paraphrases — never a headline number, occasionally a cheap sanity check. The headline metrics are the RAGAS four-cell grid, computed with a calibrated LLM-as-judge." That negative selection (anti-pattern + pattern in one breath) is exactly the senior signal the rubric is built around.
+
+
+### What Are The Five Properties Of A Good Eval?
+
+1. **Reproducibility** means your evaluation should give the same score when run multiple times on the same input. If the judge uses randomness (e.g., temperature 1.0) or the underlying model/prompt changes over time, scores can fluctuate even when your system hasn’t changed. To avoid this, **pin the judge model, use temperature 0, and lock the evaluation prompt/version**. This ensures that when scores change, you can confidently attribute the difference to your system rather than a noisy or changing evaluator.
+
+
+2. **Discriminative** means an evaluation should clearly distinguish good outputs from bad ones. The fix is to narrow the eval’s scope or use a more sensitive method, such as pairwise comparison instead of assigning fixed scores.
+
+3. **Cheap** to run means an eval should be affordable enough to run as often as needed—cheap evals can run on every CI change, while expensive ones are better suited for occasional deep analysis. 
+
+4. **Cost-controlled** means putting a clear limit on per-sample cost and monitoring it, since LLM-judge costs can increase with longer outputs, larger models, or more complex prompts. 
+
+5. **Version-pinned** means recording the exact judge, golden dataset, and system versions for every run, so scores from different time periods remain genuinely comparable. Fix: every eval run records `(judge_version, golden_set_version, system_version)`; the dashboard slices on the triple.
+
+**`The decision tree is simple`**: use the cheapest eval mechanism that can reliably answer your question. First, check whether the result is mechanically verifiable—if yes, use automated checks because they’re cheap and highly reliable. If not, ask whether an LLM judge can agree with humans well enough (e.g., Cohen’s κ ≥ 0.6); if yes, use a calibrated LLM judge. If neither works, use human evaluation, especially for subjective or high-risk judgments. The goal isn’t to use the most sophisticated method—it’s to use the cheapest method that provides enough trustworthy signal.
+
+
+
+**Why Can't LLM-Judges Cover These Four Categories?**
+
+1. Tone / voice
+
+2. Safety
+
+3. Business-rule adherence — judges have no real knowledge of your company's rules. 
+
+4. Novel-domain rollout — judges have no domain context for new domains the system has never been evaluated on. 
+
