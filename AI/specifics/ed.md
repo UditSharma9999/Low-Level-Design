@@ -1042,3 +1042,78 @@ One of the most important RAG evaluation problems is that an answer can look exc
 
 4. Novel-domain rollout — judges have no domain context for new domains the system has never been evaluated on. 
 
+
+### The RAGAS Four-Cell Grid — Diagnosing Generation vs Retrieval
+
+
+|   | Generation (about the answer) | Retrieval (about the chunks fetched) |
+|---|---|---|
+| **Precision-flavored** | **Faithfulness** — does the answer actually follow from the retrieved context? | **Context Precision** — of the retrieved chunks, how many were actually relevant? |
+| **Recall-flavored** | **Answer Relevance** — is the answer responsive to what was asked? | **Context Recall** — did retrieval surface all the chunks needed to answer? |
+
+
+The main purpose of the grid is diagnosis. Suppose your overall RAG quality decreases. Instead of saying, "quality dropped," you look at the four individual cells and determine which one changed. That can tell you whether the likely problem is the **generator, retriever, reranker, or prompt**.
+
+
+### 1. Faithfulness
+
+Faithfulness asks whether the model invented information that is not supported by the retrieved context. The model's answer is broken into individual claims, such as statements, numbers, or named entities. An LLM judge checks each claim against the retrieved chunks and determines whether that claim is supported.
+
+#### What Causes Faithfulness to Change?
+
+- **retrieval quality**: if the required chunks are missing, the model may fill the missing information using its own parametric knowledge.
+
+- **Prompt changes that loosen the grounding instruction** — removing the "answer only from the provided context" line is a common faithfulness-killer.
+
+- **Generator changes** (new model, new system prompt, higher temperature)
+
+### How Answer Relevance Is Calculated
+
+The judge LLM generates several possible questions—typically 3–5—that the given answer would be a good answer for. It then compares those generated questions with the original user question using mean cosine similarity. If the generated questions are highly similar to the original question, the answer is considered highly relevant. If they are substantially different, the model probably answered a different question from the one the user asked.
+
+
+#### What Causes Answer Relevance to Change?
+- Answer relevance can decrease when the system misunderstands the user's intent.
+
+- A system-prompt change can make answers less relevant if it forces the AI to give long introductions instead of getting straight to the point.
+
+- System may give the AI unrelated information along with the useful information. The AI can then focus on the wrong details and give an answer that doesn’t properly address the question.
+
+### Context Precision
+
+Context Precision measures how well the retrieved information is selected and ordered. It checks whether the most relevant chunks appear near the top of the results. RAGAS considers the ranking, not just how many relevant chunks were retrieved. So, if two systems retrieve the same information but one puts the useful chunks first, it gets a better score. This is why a reranker is important—it puts the most relevant results at the top.
+
+
+Context precision can change because of **reranker** changes, changes to the **bi-encoder K**, or changes to the **embedding model**.
+
+
+### Context Recall
+
+Context Recall measures whether the retrieval system found all the information needed to answer the question. It compares the retrieved chunks with a reference answer and checks whether each important part of the answer is supported by the retrieved information. A higher score means less important information was missed. 
+
+If context recall is low, the generator may simply not have enough information to answer the question correctly. Even if the generator itself behaves perfectly, the required information was never retrieved. The model then has two possibilities:
+
+1. it can hallucinate missing information, which hurts faithfulness, 
+
+2. or it can correctly say that it does not have enough information, which is safer but may reduce user satisfaction.
+
+#### What Causes Context Recall to Change?
+
+- **Embedding model** : A different embedding model may fail to rank the needed documents in the top-K results. 
+
+- **Chunk size** : Poor chunk sizes or boundaries can also split important information across chunks, making it harder to retrieve. 
+
+- **pre-retrieval transformations** : A bad query rewriter can change the meaning of the question and cause the system to miss the required information.
+
+
+### Reading the Grid in Production
+
+The important production skill is to use the four metrics together to localize failures. Different combinations indicate different problems. If faithfulness decreases while everything else stays stable, the generator likely became worse. If context recall decreases, the retrieval pipeline is likely responsible. If context precision decreases while faithfulness stays stable, the reranker may be allowing unnecessary noise through. If answer relevance decreases while faithfulness stays stable, the prompt or upstream intent routing may be directing the model toward the wrong question.
+
+> 💡 Interview Tip   
+> Reach for the diagnostic framing every time. Junior candidates report "quality went down." Mid-level candidates report "faithfulness dropped 4pp." Senior candidates report "**faithfulness dropped 4pp and context-recall dropped 7pp, suggesting the embedding-model change yesterday regressed retrieval recall and the generator is now hallucinating to fill the gap; rolling back the embedding model is the right move and I'd validate by checking that context-recall recovers before re-shipping any generator changes.**" That second sentence is the entire eval row's load-bearing skill — using the four cells as a causal localization tool, not as four numbers to report.
+
+
+
+
+
