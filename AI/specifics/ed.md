@@ -1115,5 +1115,529 @@ The important production skill is to use the four metrics together to localize f
 
 
 
+### LLM-as-Judge, and the Production Loop
+
+### 1. Why do we need to evaluate the evaluator?
+
+- The judge tends to prefer longer answers simply because they contain more text, even when a shorter answer is equally or more correct.
+
+
+- The judge tends to prefer answers that sound confident, even when a more cautious answer is actually more appropriate.
+
+- The judge and generator belong to the same model family. The judge may agree with the generated answer more often simply because they come from the same model family.
+
+### Quality check to make sure an LLM judge gives scores similar to human judges.
+
+You first take around 200–300 real questions from your system. These questions should include easy and difficult examples, different types of queries, and cases where retrieval worked or failed. Then, 2–3 humans grade all these examples using the same scoring rules that the LLM will use. If the humans themselves don't agree with each other, you first fix the scoring rules.
+
+
+After that, you give the same questions and answers to the LLM judge. You compare the LLM's scores with the human scores. **Kappa is simply a number that tells you how much the LLM agrees with humans**. A score above 0.6 is generally acceptable, while above 0.8 is very good. For a 1–5 score, weighted kappa is used because saying 4 instead of 3 is a small mistake, while saying 4 instead of 1 is a big mistake.
+
+
+You should also check each type of evaluation separately. 
+
+Finally, you repeat this calibration whenever you change the LLM judge or the scoring rules. 
+
+
+### What Is a Golden Set?
+A golden set is a curated and versioned dataset used to test retrieval quality. It contains tuples such as `(query, expected_doc_ids, optional_reference_answer)`. 
+
+
+The golden set should not simply contain random queries. It should cover:
+
+- **Different query types**, such as factoid, multi-hop, summarization, comparison, ambiguous, and out-of-corpus questions. 
+
+- **Difficulty levels**: easy questions answerable from one chunk, medium questions requiring synthesis across a few chunks, and hard questions requiring several chunks or implicit reasoning. 
+
+- It should cover the major domains and preserve historically problematic queries as permanent regression cases.
+
+
+Whenever retrieval is changed—such as changing the embedding model, chunk size, K, reranker, hybrid weighting, or index configuration—the golden-set queries should be run through the new pipeline. The system calculates **recall@K** and **MRR**, compares them against the production baseline, and blocks the change if retrieval recall regresses beyond a pre-declared threshold. A typical threshold mentioned is 2–3 percentage points absolute or 5% relative.
+
+
+### Golden set can become outdated
+
+**corpus drift**: Suppose a document was previously the correct answer for a query, but that document is later deprecated and replaced with a newer document. If the golden set still points to the old document, the evaluation will incorrectly treat the old document as the expected answer.
+
+### When Is Human Evaluation Needed?
+
+The LLM judge as the daily workhorse, while human evaluation acts as the periodic ground truth and a validator for major changes.
+
+
+1. Whenever the generator model is upgraded, human evaluation should be performed on a sample. The reason is that the new generator may produce a different type of output, and the previous judge calibration may no longer apply to that new output distribution.
+
+2. A major system-prompt change should trigger re-validation because the model's behavior may change. A large corpus change can also change the retrieval distribution, so recall needs to be checked again.
+
+3. If users report a quality problem that offline metrics failed to detect, human evaluation should focus specifically on the affected query class.
+
+
+**The three human-eval patterns:**
+
+1. Show the human two answers — one from the candidate system, one from the baseline — in randomized order, ask "which is better?" with a forced choice plus "no difference." Most reliable because humans are far better at relative judgments than absolute ones. 
+
+2. Show the human a single answer, ask for an absolute rating per dimension. 
+
+3. Each rater writes a short freeform note alongside the numeric score. Less useful for aggregate metrics; enormously useful for finding the failure modes you didn't know existed. 
+
+
+### How does the production thumbs-down funnel close the loop?
+
+
+Offline metrics like RAGAS, golden-set recall, and human evaluation tell you whether a new RAG system performs better on a predefined set of questions, but production feedback tells you how it performs on the questions users are actually asking. 
+
+When users give a **thumbs-down**, those queries become examples of real failures and can be added to the golden set.
+
+
+
+**Follow-up clarification questions**. User immediately asks "what about X" within 30s. Mixed signal: it can mean the answer was good enough to lead to a deeper question (good), or that the answer was incomplete and the user is rephrasing (bad). Disambiguate by question type.
+
+
+
+**Abandonment**. User closed the chat without acting on the response. Weak negative signal — could mean "answer was so good I don't need anything else" or "answer was useless, I'm leaving." Use only in combination with other signals.
+
+**Downstream conversion**. The user took the action the chat was supposed to help them take (filed the ticket, completed the purchase, ran the suggested SQL). The strongest signal — actually measures business value.
+
+The eval-prod loop closes when:
+
+1. **Bad-signal queries get added to the golden set**. Every query that earned a thumbs-down or that triggered an abandonment + no-conversion combo becomes a candidate for inclusion. The eval set grows from the failures.
+
+2. **Production-distribution stratification on offline eval**. Re-weight the offline eval to match the actual production query distribution, not a synthetic uniform distribution. A pipeline that scores 0.85 faithfulness on a uniform set may score 0.78 on the actual prod distribution if hard queries are over-represented in production.
+
+3. **Triggered re-eval on metric drift**. If thumbs-down rate spikes above a control threshold, automatically run a human-eval pass on the affected query class to localize the regression.
+
+
+Where Evals Plug In: Dev Loop, CI, Shadow, Prod-Sample....................
+
+The Regression Harness: Catching Prompt/Model Drift Before Users Do....................
+
+
+## RAG Ops at Scale
+
+
+## Agent Deployment Patterns
+
+**ReAct** is good when the AI needs to think and react dynamically after each tool result, while **ReWOO** is better when the steps are predictable because it can plan everything first and execute independent tasks in parallel. 
+
+In production, a good approach is therefore to use ReWOO as the normal/planned path and fall back to ReAct when something unexpected happens. 
+
+
+
+
+**ReAct** is basically an AI that works step-by-step and changes its plan based on what happens. The model first thinks about what it should do, then chooses a tool and calls it, sees the tool's result, and then decides the next step. For example, if it searches for something and gets a bad result, it can change the search query or use a different tool.
+
+The **downside** is cost and complexity: every new step adds another model call, and the model has to carry the previous conversation/history each time. After many iterations, the context becomes large and the model may become confused, repeat failed actions, or unnecessarily continue working. So, in simple terms: ReAct is flexible because the AI can change its plan while working, but that flexibility becomes expensive and less reliable when the task requires many steps.
+
+
+**ReWOO** is basically a “plan first, execute later” approach. Instead of the AI repeatedly thinking → calling a tool → seeing the result → thinking again like ReAct, ReWOO divides the work into three parts: the Planner creates the complete plan, the Worker executes the required tools, and the Solver looks at all the results and produces the final answer. For example, the Planner might say: “First search X → save it as E1; then use E1 to search Y → save it as E2; finally combine E1 and E2.” The Worker executes those steps, and steps that don't depend on each other can run at the same time, making the system faster and cheaper. 
+
+The big **advantage** is that you only need roughly two LLM calls—one for planning and one for the final answer—instead of many LLM calls like ReAct. It also makes debugging easier because you can see and save the exact plan the AI created.    
+The **weakness** is that ReWOO is less flexible: if something unexpected happens halfway through, the original plan may no longer make sense. 
+
+
+**context window** is the amount of text/information an LLM can see and use at one time while generating an answer. A bigger context window is not a replacement for memory.
+
+A production agent usually separates memory into three levels:
+
+- **Short-term memory** → what is happening right now in the current task/session. Usually stored in the context window.
+
+- **Episodic memory** → important past experiences/events, such as “the user previously asked for X” or “we tried approach Y and it failed.” Usually stored in a database.
+
+- **Semantic memory** → persistent facts and knowledge, such as user preferences, company information, or documents. Often stored in a database/vector store and retrieved when needed.
+
+
+### 1. Short-Term Tier
+
+This section explains what to do when the conversation becomes too large for the model’s context window. The context contains the current tool calls, previous observations, and intermediate information, so eventually the system needs a strategy for deciding what information to keep and what to remove.
+
+
+Three strategies:
+
+- **Sliding window** is the simplest approach. You keep only the most recent **N conversation** turns verbatim and remove older turns. The problem is that important information from the beginning can disappear. This is especially risky because the user's initial request may contain the actual goal of the entire session.
+
+
+- **Summarization** is the standard production approach. When the context buffer reaches around 60–70% of its limit, a cheaper model summarizes the older part of the conversation into 1–2 paragraphs. 
+
+- **Hierarchical** memory is a more sophisticated approach. Recent turns remain **verbatim** (exactly as it was spoken or written
+), mid-distance conversations are stored as **summaries**, and very old information is compressed into one **rolling summary**. This gives more graceful degradation because information is compressed at different levels instead of being discarded all at once. However, it requires more engineering.
+
+Most production systems eventually choose summarization with a cheap model, because it provides a good balance between simplicity and longer sessions. Hierarchical memory is mainly reserved for long-running research agents where sessions can last for hours and a single summary would lose too much information.
+
+### 2. Episodic memory
+
+This section is about remembering information from previous conversations, rather than keeping the entire current conversation. For example, if a user previously asked for a deployment plan and later asks about it again, the assistant can search past sessions for that relevant information.
+
+The previous conversations can be stored in a per-user vector store, such as Pinecone, Weaviate, or Postgres with pgvector. When a new session begins, the system takes the user's first message, creates an embedding for it, and uses that embedding to retrieve the top-K most relevant past sessions. Those retrieved sessions are then added to the current context.
+
+The important idea is that the system does not load the user's entire history. That would consume too many tokens. Instead, it retrieves only the relevant slice of previous conversations needed for the current request. This is what creates the feeling that an assistant “remembers you” across separate sessions.
+
+#### Tenant isolation 
+Tenant isolation must be enforced at the storage layer, not merely by application code. A user's memories must never be returned to another user, even if two users have semantically similar queries.
+
+There are two common approaches:
+
+- **Separate index per tenant/user** → User A's memories and User B's memories live in completely separate indexes.
+
+- **Tenant ID filtering at the storage layer** → Every memory has something like `tenant_id = A`, and the database itself guarantees that User A can only retrieve records belonging to A.
+
+
+### 3. Semantic Tier
+
+This is the common knowledge layer of the system. It contains information such as documents, runbooks, FAQs, and product catalogs that multiple users may need.
+
+This layer is essentially the RAG retrieval layer. The system can use a vector database or a hybrid BM25 + dense retrieval approach to find relevant information. Depending on the classification of the data, the index can either be tenant-specific or global.
+
+The agent's tool calls can target any of these three tiers. A search tool might hit episodic (`"what did this user say last week?"`), semantic (`"what does our docs say about pricing?"`), or both, depending on the query.   
+An **important design point** is that the tool itself should clearly identify which tier it targets. The system should not treat “search” as one generic operation without knowing where the search is happening.
+
+
+#### How a production agent should manage memory across different time periods. 
+
+The easiest way to understand it is: **short-term memory is the agent's current working space, episodic memory is the user's history, and semantic memory is shared knowledge/documents**. Each one should have its own storage, rules for how long data is kept, and privacy restrictions.
+
+**For example**: imagine a user starts a new session and says, “Continue the deployment plan we discussed.” The agent doesn't magically remember the old conversation. First, it searches that user's episodic memory for relevant past conversations. It might find a previous session called “deployment plan, June 12” and bring a short summary of it into the current context. Then, while working, if it needs company-specific information such as a deployment runbook, it retrieves that from the semantic/RAG knowledge base. Meanwhile, the current conversation is stored in the short-term context window. As that context gets too large—say around 60–70% of its limit—the system summarizes older conversation and keeps the shorter summary instead. Finally, when the session ends, the system creates a summary of the session and saves it to that user's episodic memory, so it can potentially be retrieved next time.
+
+
+
+
+### Why Does The Loop Need Bounding At All?
+An AI agent needs limits on how long it can keep running because, unlike a normal API, it may not naturally know when to stop. Imagine a while loop that keeps asking the AI what to do next; if a tool fails, the AI might keep retrying the same broken tool again and again.
+
+
+**1. Iteration cap** simply means putting a maximum limit on how many times an agent is allowed to call tools. When the limit is reached, the agent should stop gracefully instead of continuing forever.
+
+- 5 for narrow agents (structured-extraction, single-purpose)
+- 10 for research-class agents (multi-step, branching)
+- 15-20 only with strong justification 
+
+
+**2. Hard session-duration** limit means the entire task—from the first request through all tool calls and processing—must finish within a fixed maximum time. 
+
+
+**3. Loop detection** is a safety check that catches when an agent is repeating the same action without making progress. For example, if the agent calls Tool A, gets an error, and then calls Tool A again with almost the same inputs, it may keep repeating. A normal time or iteration limit might only stop it after several attempts. Loop detection watches the recent tool calls and notices when the same call happens repeatedly
+
+**4. Per-session $-cap** is basically a safety limit on how much money one user request/session is allowed to consume. For example, When the session reaches around 70% or 90%, it can warn the agent to wrap up.
+
+
+
+> Tools will sometimes fail, and a good agent should know how to recover instead of blindly trying again. If a tool takes too long, stop it and retry with a delay or use a backup tool. If it returns the wrong data format, validate it before giving it to the agent and retry once if needed. If it returns HTTP 200 but actually contains an error, check the response body before treating it as successful. The hardest case is when the tool returns a valid-looking answer that is actually wrong, so use sanity checks or cross-check it when accuracy matters. Most importantly, when retrying, tell the agent what went wrong so it can change its approach
+
+<br/>
+
+**Checklist :**
+
+don’t rely on just one safety limit for an AI agent—use several layers because each catches a different problem. The iteration cap stops too many attempts, the time cap stops a request that runs too long, the $ cap stops the agent from spending too much money, and loop detection stops it when it keeps repeating the same action. On top of that, you can have daily user limits, tenant/company limits, and global cost alerts. For tool failures, retry temporary errors, validate bad responses, detect hidden errors, and let the agent change its approach instead of blindly repeating the same call.
+
+
+
+> 💡 For an interview,    
+> the strongest short explanation is: “I would use a per-session trace containing tool calls, inputs/outputs, latency, cumulative cost, and a fixed end state, emitted through OpenTelemetry with GenAI semantic conventions and viewed in something like Phoenix or LangSmith. I would also log LLM inputs for replayability and have configuration-based kill switches for both individual tools and the whole agent.” The source specifically highlights observability and kill switches because they demonstrate production-oriented thinking.
+
+<br/>
+
+### Other Patterns: 
+
+ReACT and ReWOO are not the only ways to build an AI agent. There are three other common patterns. **Observe-Think-Act (OTA)**, **Plan-and-Execute**, **Ralph loop**.
+
+
+**1. OTA (Observe-Think-Act)** is a general version of the agent loop. 
+1. First, the **agent** observes what is happening—for example, checking a file, reading a queue, getting a metric, or checking a build status. 
+2. Then it **thinks** about what that information means and decides what to do. 
+3. Finally, it **acts**, such as calling a tool, editing something, or sending a notification. 
+
+**ReACT is basically a simpler version where Observe and Act are often combined**, because the agent usually just receives the user's latest message as its observation. OTA becomes more useful when the world can change without the user saying anything. For example, an agent that checks a build every 5 minutes needs to first observe the build status, then think about whether there is a problem, and only then act by diagnosing and notifying someone. **So the simple rule is: if the agent mainly responds to user messages, ReACT is enough; if it needs to continuously watch or check an external environment, OTA makes more sense**.
+
+
+**2. Plan-and-Execute** means “make the plan once, then follow it.” 
+
+1. First, a **planner** LLM creates a list of steps, such as: `1) classify the support ticket → 2) find relevant information → 3) write a reply → 4) route the ticket`. 
+2. Then an **executor** performs those steps without asking the LLM to create a new plan after every action. 
+
+This makes it cheaper than ReACT, because ReACT keeps thinking and replanning after each step. At the same time, it is more flexible than ReWOO, because if something goes wrong at a major step, the system can go back to the planner and create a new plan. The main difference is that **Plan-and-Execute is basically a simple sequential step list, while ReWOO creates a more structured workflow with separate workers/solvers and can handle parallel work better**.
+
+
+**3. Ralph loop** is the simplest type of AI agent: it has one tool and keeps using that same tool until the job is finished. There is no need for the AI to decide “which tool should I use?” or create a new plan each time, because there is only one possible action. For example, a crawler can repeatedly fetch the next page or a watcher can repeatedly check a metric.
+
+
+## Tool Calling and Execution
+
+
+Tool calling is not just a switch you turn on to give an AI access to tools. In production, you need to think about four separate things: 
+
+1. **schema validation** (making sure the AI sends the right inputs).
+
+2. **sandbox boundaries** (limiting what the AI is allowed to access or execute).
+
+3. **failure handling** (deciding what happens when a tool fails).
+
+4. **caching** (avoiding repeated, expensive calls). 
+
+
+### Schema validation
+
+**tool-call payload** is just the structured message the AI sends when it wants to use a tool. 
+Before the AI uses the tool, you define the tool's name, description, and the exact format of inputs it accepts (JSON schema). Without a schema, the AI could produce almost any text and your code would have to figure out what it means, creating many possible failure cases.
+
+
+Schema checks whether the data has the correct shape, but it does not necessarily check whether the data is safe or sensible.
+
+**Pydantic/Zod validators**: Instead of defining your tool input as just file_path: str, you define an input model with additional validation rules. For example, you might say that the path must not contain .., the encoding must be one of the allowed encodings, and the file size must be below a fixed limit.
+
+So there are really two defenses. The first is the `schema` and second is `validator`.
+
+#### Retry-on-validation-error loop
+
+The **retry-on-validation-error loop** is basically a way of letting the model correct its own tool call when your application rejects it. Imagine the model wants to call a file-processing tool and sends max_bytes = `5000000`, but your Pydantic validator says the maximum allowed value is `1048576`. The validator rejects the call and produces a specific error such as **“max_bytes must be between 1 and 1048576; got 5000000.”** Instead of immediately giving up, your agent sends this error back to the model as a structured `tool_result` with `is_error=true`. The model can then understand exactly what it did wrong and generate a corrected tool call, perhaps with `max_bytes = 500000`.
+
+You normally limit this to around 2–3 retries. This is important because you don't want an agent stuck endlessly generating invalid calls. If the model still cannot produce valid arguments after the retry limit, the system moves to a degraded/failure handler. Instead of crashing, it can tell the user something like “I couldn't complete that action,” while logging the validation failure so developers can investigate it later.
+
+
+### MCP and the Protocol Boundary
+
+Every protocol use in diffrent situation.
+
+MCP (Model Context Protocol) addresses a similar organizational problem, but for LLM clients communicating with tools. Imagine your company has a corporate wiki-search tool. You want to make it available in a desktop AI assistant, so you build an integration specifically for that assistant. Later, you want the same wiki search in a web chatbot, so you build another integration. Then an IDE assistant needs it, requiring another integration. The actual tool hasn't changed—you are simply repeatedly writing adapters because every LLM client has its own way of connecting to tools.
+
+This becomes a classic **N × M problem**. Suppose you have 4 LLM clients and 12 internal tools. Without a common protocol, potentially every client needs a separate integration with every tool: 4 × 12 = 48 integrations. That's a lot of code and maintenance. With MCP, each tool can expose an MCP server, and each client can implement the MCP client/protocol once. You then have roughly 12 tool servers + 4 clients = 16 reusable components, rather than 48 bespoke connections. The important benefit is that any MCP-compatible client can communicate with any MCP-compatible server.
+
+MCP doesn't magically make dangerous code safe, so you still need a sandbox when appropriate. It also isn't automatically a security system. Authentication, authorization, input validation, sandboxing, and tool-specific security rules still need to be enforced by the underlying system.
+
+
+**MCP can be understood as a standard communication layer between an AI application and external tools/data.**
+
+
+
+- **MCP server** is basically a wrapper around some external capability or domain. For example, you could have a GitHub MCP server, a Postgres MCP server, or a Slack MCP server. A server can expose three main things: tools, which are actions the AI can invoke; resources, which are data the AI can read; and prompts, which are reusable prompt templates. For example, a GitHub server might expose a search_repositories tool, a repository README as a resource, and a reusable code-review prompt.
+
+
+- **MCP client** lives inside an AI application. When the application connects to an MCP server, the client first asks the server what it provides. The server might respond with something conceptually like: “I have these 10 tools, these 3 resources, and these 2 prompts, and here are their schemas.” The client can then decide which of those capabilities should be made available to the LLM. So the LLM doesn't necessarily need to know beforehand that a particular server has a particular tool—the application can discover it dynamically.
+
+
+- The actual communication can happen through different **transports**. For local tools, MCP can use stdio, where the client starts the MCP server as a subprocess and communicates through standard input/output. This is useful for things such as local developer tools. For hosted servers, MCP supports Streamable HTTP, where communication happens through an HTTP endpoint and server-to-client streaming can use Server-Sent Events when needed. The important architectural idea is that the MCP protocol itself sits above the transport, so the higher-level MCP concepts aren't tied to one particular communication mechanism.
+
+
+- **Authorization** for hosted servers is standardized on OAuth 2.1 (formalized in the 2025 spec update), with PKCE for public clients and standard scopes for tool / resource / prompt access. Don't ship a hosted MCP server without it; the early-MCP pattern of "rely on the transport's auth" doesn't scale across clients.
+
+**Client → connect to server → server describes capabilities → client selects capabilities → LLM can use selected tools**
+
+
+The biggest architectural advantage is therefore `“one server, many clients.”` 
+
+
+MCP creates a standardized home for tool descriptions and schemas. The server can describe what a tool does, what parameters it accepts, and what those parameters mean. The client can retrieve that information instead of maintaining its own hard-coded copy. This also means that if the tool description needs to change, the server-side definition can become the shared source of truth rather than requiring changes in every individual AI client.
+
+
+> Don't design your architecture around MCP. Design it around the properties MCP provides.
+
+> MCP may eventually be replaced. That's normal. If your architecture depends on capability discovery + standardized schemas + independent tool servers + a replaceable transport, then replacing MCP becomes an implementation change rather than a complete architectural redesign.
+
+
+### Sandboxed Execution for LLM-Generated Code
+
+once an AI agent is allowed to generate code and execute it, the security risk becomes much bigger.
+The most important rule is therefore: never execute LLM-generated code inside the same process as your main application. Instead, send the generated code to a sandboxed runtime. A sandbox is an isolated environment where the code can run without having unrestricted access to your application, operating system, files, or network. Depending on the required isolation and performance.  The basic idea is that even if the generated code is malicious or goes wrong, the damage is contained inside the sandbox rather than affecting your main application.
+
+#### The Demo Where The Agent Reads Your Environment Variables
+
+This example shows why executing AI-generated code is fundamentally more dangerous than simply letting an AI call a normal tool. Imagine a user asks an agent to analyze a CSV file. The agent decides to generate Python code to perform the analysis, and the application blindly executes that Python inside the same process as the production API. If that generated code can access os.environ, it may be able to read environment variables containing sensitive information, such as database credentials or connection strings, and potentially return that information through the chat response.
+
+
+#### What could go wrong if the AI-generated code is allowed to run?
+
+The passage identifies three major risks:
+
+
+1. **Resource exhaustion** means the generated code consumes too many resources. For example, the model might accidentally create an infinite loop, allocate an enormous amount of memory, use excessive recursion, or generate a database query that runs for hours. The important defense is to enforce **hard limits outside the generated code**, such as maximum CPU, memory, disk usage, and execution time. If the program exceeds the limit, the sandbox terminates it.
+
+
+
+2. **Data exfiltration** means the generated code gets access to information it shouldn't have and sends that information back as part of the result. For example, generated code could potentially read environment variables, files, network information, or secrets available to the process. This could happen because someone intentionally manipulates the prompt, because an external document contains an indirect prompt injection. The defense is to make sure the **sandbox doesn't have access to sensitive data in the first place**, rather than relying on the model to avoid reading it.
+
+
+3. **Privilege escalation and lateral movement** are the most serious risks. Here, generated code doesn't just access data—it tries to reach other systems or capabilities. For example, it might attempt to interact with internal services, access files outside its working directory, modify system files, or establish network connections to systems that the agent shouldn't be able to reach. Capability allow-lists are the key defense: explicitly decide what the sandbox is allowed to access and deny everything else by default.
+
+
+#### Common security properties that every good sandbox should have
+
+The specific technology can change, but these protections should remain. 
+
+**1. Enforce resource limits at the runtime level**.
+
+**2. Networking should be disabled by default**. This is one of the strongest defenses against data exfiltration. If the generated code can read a secret but cannot establish an outbound network connection, it has a much harder time sending that secret somewhere else. If a particular tool genuinely needs network access—for example, querying one specific API—you should explicitly allow that destination. In other words, use allow-listing: “This sandbox can access this API”, rather than “This sandbox can access everything except these known bad destinations.”
+
+
+**3. Use capability allow-lists**. The sandbox should explicitly define what the generated program is allowed to do. For example, perhaps Python can perform calculations and read files from /tmp, but cannot access arbitrary filesystem locations or execute system commands.
+
+**4. The filesystem should be ephemeral and request-scoped**. Each execution should receive a fresh working directory or volume. The generated program can create temporary files there, but when the request finishes, that environment is destroyed. This prevents one execution from leaving files or state that another execution can access. If something genuinely needs to persist, it should go through a controlled storage API rather than simply giving the generated code permanent filesystem access.
+
+
+**5. Every execution needs a wall-clock timeout**. You should never allow generated code to run indefinitely.
+
+
+#### What Layers Above The Sandbox Cut The Volume?
+
+
+The sandbox remains the most important security boundary, but you shouldn't make the sandbox handle every suspicious request by itself.
+
+
+**1. Input filtering** happens before the code reaches the sandbox. You can look for cheap warning signals. For example, if an agent suddenly starts generating hundreds of unusual system-level operations, you might block the request or send it for additional review.
+
+
+**2. Output filtering** checks what comes out of the sandbox. Suppose the generated program somehow obtains a piece of sensitive-looking information and includes it in its result. Before that result is passed back into the LLM's context, you can scan it for patterns resembling API keys, long encoded blobs, internal hostnames, etc.
+
+
+**3. Audit logging** gives you visibility into what is actually happening. For every execution, you can record things such as the generated code, arguments, exit status, resource consumption, attempted network calls, and result size. Later, security engineers can investigate incidents or analyze patterns.
+
+**4. Rate limiting** controls how frequently the agent can execute code. Imagine one session generates 200 executions within 30 seconds. That could indicate an attacker probing the system, or simply an agent stuck in a runaway loop.
+
+
+### Retry, Caching, and Tool Descriptions as Prompts
+
+
+
+**Transient error** means the request might succeed if you try it again later. For example, the server returns 503, the network temporarily disconnects, a request times out, or you receive a 429 rate-limit response. These are generally handled by the transport layer using retries, usually with exponential backoff and jitter:
+
+
+**Semantic error** is different. It means the request itself needs to change. Examples include:
+
+- Invalid SQL syntax
+- A nonexistent database column
+- Invalid tool arguments
+- Wrong parameter type
+- Choosing the wrong tool
+
+
+Imagine your AI agent wants to query a database and generates:
+
+    SELCT name FROM users
+
+There is a typo: `SELCT` instead of `SELECT`. The database returns something like `“syntax error near 'SELCT'.”` Now suppose your application has a generic retry mechanism that says, “If the tool fails, try again three times.” It will send exactly the same SQL three times:
+
+    SELCT... → ❌ error
+    SELCT... → ❌ error
+    SELCT... → ❌ error
+
+Nothing improves because the request itself is wrong.
+
+
+#### What Are The Four Retry-and-Resilience Patterns?
+
+
+**Pattern 1 — Exponential backoff with jitter**, for transient failures. The classic. HTTP 503, connection reset, timeout. Wait 1s, then 2s, then 4s, then 8s — each with random jitter (e.g., delay * (0.5 + random())) to avoid thundering-herd on a recovery. Use this when: the request is correct, but the infrastructure temporarily failed. Cap at ~5 attempts and ~30s total wait.
+
+**Pattern 2 — Semantic retry**, for LLM-error failures. The tool returned an error message that suggests the LLM called it wrong ("invalid SQL: column does not exist", "file not found", "argument out of range"). Don't retry the same call — that's the same wrong call. Instead, feed the error back to the LLM as the tool result and let it generate a new call. The LLM is remarkably good at fixing its own mistakes when shown the actual error message. Usually you cap (Limit) semantic retries at around 2–3 attempts, because otherwise an agent could repeatedly generate bad calls and consume a lot of LLM tokens and tool resources.
+
+**Pattern 3 — Fallback tool** is used when the primary tool is unavailable and another tool can perform a similar task. For example, if Search API A is down, the system can automatically use Search API B. The important part is that the application already knows this relationship, so it does not need to ask the LLM to choose another tool. This saves an extra LLM round trip. The secondary tool might provide slightly lower quality, but the system can still return a useful result instead of completely failing. This is called graceful degradation.
+
+**Pattern 4 - circuit breaker** is like a safety switch that stops your application from repeatedly calling a service that is currently broken. For example, suppose your agent calls a database or API and it keeps failing—say 5 failures within 60 seconds. Instead of continuing to call it and making every request wait for a timeout, the circuit breaker changes to OPEN, meaning “stop calling this service for now.” After waiting for some time, it changes to HALF-OPEN and allows one test request to check whether the service has recovered. If the test succeeds, it becomes CLOSED, meaning everything goes back to normal. If the test fails, it becomes OPEN again.
+
+
+
+#### How Do The Four Patterns Compose?
+
+The four patterns work together in a particular order, and each one operates at a different layer. First, the agent tries to call the tool normally. If the tool fails because of a temporary problem, such as a timeout or 503, the system uses exponential backoff and retries the same call several times. If those retries keep failing, the system checks the circuit breaker. If that tool has been failing repeatedly, the circuit breaker can open and stop further calls to that service for some time. If a fallback tool is available, the system can then try that alternative tool, which also has its own retry policy. If there is no fallback or the fallback also fails, the system sends a structured error back to the agent loop with is_error=true and a clear explanation of what went wrong.
+
+At that point, the LLM gets involved. It receives the error and decides what to do next. If the original request was semantically wrong—for example, incorrect SQL or invalid arguments—the LLM can perform a semantic retry by generating a corrected tool call. If the task cannot be completed, it can instead give up gracefully and provide an appropriate response to the user. So the overall flow is: `try → backoff retry → circuit breaker → fallback → send error to LLM → semantic retry or give up.`
+
+
+#### Why Cache Tool Results, And What's The Cache Key?
+
+
+The LLM may call the same tool with the same inputs multiple times (same database record several times, or request the same weather information twice).
+
+A **tool-result cache** solves this by storing the result of a tool call. The cache uses a key made from tool_name + normalized_arguments. Before actually calling the tool, the system checks the cache. If the same tool was already called with the same arguments during the current agent session, the system simply returns the stored result instead of making another API call.
+
+
+The important part is how the cache key is created. Two requests may be logically identical even if their JSON formatting is different. Therefore, the arguments should be normalized before creating the key. This can mean sorting JSON keys, converting appropriate strings to lowercase, rounding floating-point values consistently, and removing fields that don't affect the actual result.
+
+This section explains that **caching can work at different levels**. 
+
+- **per-session**, meaning the cache only exists while handling one user's current request. It prevents duplicate tool calls within that single agent session.
+
+- **cross-session**, per-user caching. Here, a result can be reused across different sessions for the same user.
+
+Cross-session caches usually have a TTL (time-to-live), meaning the cached result is kept only for a certain amount of time. A major problem can happen when a popular cache entry expires: many agents may request the same thing at exactly the same time. All of them see that the cache is empty and independently call the underlying tool. This is called a **cache stampede**.
+
+
+The solution is called **single-flight**. When the first request discovers that the cache is empty, it starts fetching the result and marks that fetch as in progress. Other requests for the same cache key don't start their own fetches; instead, they wait for the first request to finish. Once the result arrives, **all of them share that same result**, and it can be stored in the cache.
+
+
+#### Why Are Tool Descriptions Prompts?
+
+
+Tool names and descriptions are actually a type of prompt. Those descriptions are sent to the model along with the request, so they influence the model's decision just like a normal system prompt does.
+
+Because tool descriptions influence model behavior, they should be managed like prompt engineering. You can keep different versions of descriptions, test new versions before releasing them, monitor how often the correct tool is selected, and quickly roll back a bad description.
+
+**Observability** means logging what happened when the agent selected a tool. You record things such as the user's query, which tool the model selected, what other tools were available, and the exact versions of the descriptions shown to the model.
+
+
+### Parallel Tool Calls and Partial Failures
+
+**Dependency graph** before executing the calls. First, it parses all the tool calls and their arguments. Then it checks whether an argument depends on the output of another tool call. Independent calls are placed in the same layer and can run in parallel. Dependent calls are placed in a later layer and must wait for the earlier layer to finish. This is essentially a **topological ordering** of the tool calls.
+
+
+
+
+#### What Are The Four Partial-Failure Modes?
+
+**partial-failure handling**: what should happen if some calls succeed but others fail? For example, if 5 tool calls are executed in parallel and 3 succeed while 2 fail
+
+
+**1. Abort-all** means that if one or more calls fail, the runtime treats the whole batch as failed. It may cancel calls that are still running or simply discard the successful results and send one error to the LLM. This is useful when the operations are connected and partial completion would leave the system in an incorrect state.
+
+
+
+**2. Continue-on-error** with structured result envelopes means you don't throw away the successful calls just because some failed. Each call returns a standard structure containing information such as its call_id, whether it succeeded or failed, its result if successful, and its error if it failed. For example, the LLM might receive 3 successful results + 2 error results and reason using whatever information is available. This works well when calls are independent and partial information is still useful, such as RAG retrieval, where losing one document does not necessarily prevent the agent from answering.
+
+**3. Retry-failed-only** means you keep the results of the successful calls and retry only the failed calls. You don't unnecessarily repeat the three successful calls. This is useful when failures are mostly temporary, but there is a risk of creating a retry storm if the upstream service is actually down.
+
+**4. Surface-to-LLM-for-replan** means the runtime gives the LLM both the successful results and the failure information, and the LLM decides what to do next. It might retry a failed call, choose another tool, abandon part of the task, or tell the user that the task cannot be completed completely. This is particularly useful when the failure is semantic and the correct next action depends on the overall task. The disadvantage is that every replan requires another LLM call, which increases cost and latency.
+
+
+
+The **result envelope** gives the agent three important benefits. 
+
+1. First, the LLM gets the failure information in a structured format instead of just receiving a random error message.
+
+2. Second, the runtime itself can make decisions using these envelopes. Suppose one layer of parallel tool calls finishes and some calls succeed while others fail. The runtime can look at the structured results and decide what the next layer should do without asking the LLM another time. For example, if one result says service_unavailable, the runtime could automatically use a fallback tool.
+
+3. Third, the envelope can carry cost and latency information along with the result.
+
+
+#### How Do You Bound Cost When Calls Fan Out?
+
+
+how to control cost when an AI agent makes many tool calls at the same time. Parallel execution makes an agent faster, but it can also make it spend money very quickly.
+
+
+
+1. The first control is a **per-batch call limit**. This means the runtime puts a maximum number of tool calls that can be executed from one LLM response.
+
+2. The second control is a **per-session call budget**. The entire agent session has a maximum amount of tool usage or cost it is allowed to consume. This works together with the overall session cost limit.
+
+
+3. The third control is **per-tool concurrency limits**. Some external tools have their own rate limits. For example, a third-party API might allow only a certain number of requests at once.
+
+
+### Streaming and Partial Results
+
+
+<h4> Four important parts of production LLM streaming: </h4>
+
+**1. Transport — SSE (Server-Sent Events)**: SSE is commonly used to send LLM output from the server to the client as it is generated.
+
+
+**2. Partial structured-output parsing**: This becomes important when the LLM is generating something structured like JSON. The JSON is incomplete while the model is still generating it. For example, you might temporarily receive something like `{"intent": "bil` which is not valid JSON yet. A normal json.loads() would fail, but a streaming decoder needs to understand that the model is still generating the value. It should be able to recognize partial fields and incomplete lists or objects without crashing. That's why production systems use tolerant, schema-aware streaming parsers instead of treating every chunk as a complete JSON document.
+
+For example, after chunk 1, we only have `{"intent": "bill`. A normal JSON parser rejects this because the string and object are incomplete. But a schema-aware decoder knows that intent must be one of billing_question, tech_support, or feedback. It sees that "bill is a valid prefix of billing_question, so instead of treating it as an error, it understands that the model is currently generating the intent field.
+
+This is the main benefit of structured-output streaming: **the application can render information as soon as individual fields become determinable instead of waiting for the entire JSON object.**
+
+
+**3. Mid-stream guardrails**: Guardrails should sometimes run while the response is being generated, rather than waiting until the entire response is complete. Otherwise, the user may already have seen problematic output before the system detects it. A guardrail can inspect each chunk or completed structured field and potentially modify it, stop the stream, or send a warning event to the client.
+
+
+
+**4. Abort-signal propagation**: If the user closes the chat or presses stop while the response is streaming, the system should not only stop sending data to the browser. It should also cancel the upstream LLM request and any tool calls that are still running.
 
 
