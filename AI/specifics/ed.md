@@ -1641,3 +1641,148 @@ This is the main benefit of structured-output streaming: **the application can r
 **4. Abort-signal propagation**: If the user closes the chat or presses stop while the response is streaming, the system should not only stop sending data to the browser. It should also cancel the upstream LLM request and any tool calls that are still running.
 
 
+## Agent Memory and Lifecycle
+
+### What Is The Right Backend For Short-Term?
+
+Short-term memory is not really a database at all. That includes the system instructions, tool schemas, retrieved context, and recent conversation history. So if the user says something three turns ago and the agent needs it now, the simplest solution is usually to keep those relevant turns in the current context rather than searching a vector database for them.
+
+There can still be a supporting storage layer. An in-process LRU cache. If the application has multiple processes or servers, Redis can be used instead.
+
+example shows why using a vector database here is the wrong abstraction. Suppose a user asks about something they said three messages ago. If you put every conversation turn into Pinecone, each new turn may require **embedding → vector search → reranking → prompt construction** before the LLM can answer
+
+
+
+### What Is The Right Backend For Episodic?
+
+
+The important requirement is **strict per-user isolation**. If Alice asks the agent to retrieve her previous conversations, the storage system must make it structurally impossible for the query to accidentally return Bob's data.
+
+
+One approach is a vector database such as Pinecone or Weaviate using separate per-user namespaces. The namespace becomes part of the query itself. A query against Alice's namespace retrieves Alice's memories; it doesn't automatically search Bob's namespace. Again, the desired failure mode is that a wrong or missing namespace produces no useful result, rather than exposing another user's information.
+
+
+Another production approach is **PostgreSQL + pgvector + Row-Level Security (RLS)**. 
+
+
+### What Is The Right Backend For Semantic?
+
+
+for a system serving multiple customers, you typically use a **tenant-scoped hybrid index, combining BM25 keyword search + dense vector search**. This lets you retrieve information using both exact keyword matching and semantic similarity. If the system is single-tenant or only contains public knowledge, a global index can be sufficient.
+
+The new idea here is at the agent/tool layer. Instead of giving the LLM one generic “memory” tool and allowing it to search everything, the tool definitions explicitly tell the agent which memory tier it is accessing. For example, `search_docs(...)` represents semantic memory—searching the organization's knowledge base. `recall_user_preference(...)` represents episodic memory—retrieving something specific to that user. `current_session_context(...)` represents short-term memory—accessing information already available in the current conversation/session.
+
+This separation is important for **privacy and security**. If the agent only has a semantic-search tool, it shouldn't suddenly use that tool to retrieve private user memories. Likewise, an episodic-memory tool should not become a general-purpose company knowledge search. The tool surface creates an architectural boundary between the tiers.
+
+The phrase “the tool surface encodes the tier” basically means that the agent's available tools themselves communicate the memory architecture:
+
+
+    current_session_context()
+        ↓
+    Short-term memory
+
+    recall_user_preference()
+            ↓
+    Episodic memory
+
+    search_docs()
+            ↓
+    Semantic memory
+
+
+This prevents **prompt drift** from accidentally collapsing the privacy boundaries. Even if the LLM's interpretation changes slightly from one prompt to another, it still has separate tools with separate storage and access policies.
+
+
+### Why Is "Context Size" Not "Working Memory Size"?
+
+
+A model might advertise a 128k-token context window, but that does not mean you can fill all 128k tokens with useful information. The context window is shared by everything involved in the request: system instructions, tool definitions, conversation history, retrieved RAG documents, and the model's output. So the actual space available for useful working memory is smaller.
+
+For example, imagine:
+
+    128k total context
+    - system prompt
+    - tool schemas
+    - conversation history
+    - retrieved documents
+    - output reservation
+    -----------------------
+    = actual working space
+
+So when designing an agent, you should think in terms of a context budget, not simply the maximum context-window size. The exact usable amount depends on the application, but the important principle is that some of the context is already consumed by fixed costs and some must be reserved for the model's response.
+
+
+There is also a second problem: being inside the context window doesn't mean the model will use the information equally well. This is the **lost-in-the-middle phenomenon**. 
+
+
+### What's The Right Eviction Policy When You Have To Drop?
+
+
+**1. Sliding window** — keep the last N turns verbatim, drop the rest.
+
+
+**2. Summarization-replace**: Already covered.
+
+
+**3. Priority-queue eviction**: Instead of treating every piece of context equally, you give each turn or context block a priority score based on how important it is to the task.   
+For example, the user's original goal might get priority 10, because losing it could make the agent forget what it is actually trying to accomplish. An intermediate reasoning step might get priority 5, while a tool result that turned out to be useless might get priority 2. When the context exceeds the allowed budget, the system removes the lowest-priority items first.
+
+
+### What Are The Three Summarization Shapes?
+
+**Rolling summary** — single paragraph, replaces the older half of the buffer when threshold hits. 
+
+**Hierarchical summary** — keeps three zones in the buffer: recent verbatim (last N turns, ~20-30% of budget), mid-distance summarized (rolling paragraphs covering the next ~30%).
+
+**Priority-pruned** — every turn gets a priority score (user goal: 10, confirmed decision: 9, tool output that didn't help: 2, agent inner-monologue: 5). 
+
+
+### When Is The Right Time To Write To Episodic?
+
+
+**1. Write-on-session-end** — at session close, summarize the whole session, embed the summary, append to the user's episodic namespace. Simplest. **Failure mode**: if the session crashes mid-task, the episodic store has no record that anything happened — the next session starts blind. Fine for chat agents where session crashes are rare and low-stakes; brittle for long-running agents.
+
+**2. Write-on-event** — every "significant turn" (the user states a preference, the agent completes a sub-task, a key decision is made) writes a small embedding immediately. More writes, more durability. **Failure mode**: the team has to define significant, which becomes an ongoing tuning problem; dedup gets harder; the episodic store fills with noise if the threshold is too loose.
+
+**3. Write-on-checkpoint** — bundled with the lifecycle checkpoints from Ch 12 L5. Whenever the agent persists state for crash recovery, it also writes the episodic summary. Aligns the durability stories. **Failure mode**: if checkpoints are too infrequent, the episodic record is too coarse.
+
+
+
+
+### How Do You Avoid Dedup Hell?
+
+When an agent stores summaries or memories, it can accidentally **store the same information multiple times**.
+
+**1. content-addressed keys**. Here, you hash the actual summary content and use that hash as the primary key. If exactly the same summary is written again, it produces the same hash, so the system recognizes that the content already exists and treats it as the same row.
+
+**2. Embed-then-compare:** The second method handles near duplicates, where the meaning is the same but the wording is different. Before writing a new summary, the system creates an embedding for it and compares that embedding with nearby existing entries using cosine similarity. If the similarity is greater than 0.95, the system considers the new summary sufficiently similar and can skip the new write or merge its timestamp into the existing entry.
+
+
+### File System as Context
+
+If the agent is editing auth.py, it needs the exact current contents of the source file. A summary of the file is not enough because the next edit may depend on exact tokens, code structure, or existing content.
+
+**File-system-as-context** solves this by moving the detailed state outside the LLM's working memory. The disk becomes the source of truth for things like code, documents, plans, and scratchpads. The LLM only loads the files it currently needs through tool calls. When it needs to modify something, it writes the changes back through a tool call.
+
+
+The main advantage is **lossless eviction**. With summarization, some information can disappear because the summary is necessarily a compressed representation of the original. With file-system-as-context, closing a file does not change its contents. When the agent needs it again, it performs a fresh read and gets the full information back. The downside is that reading and writing files requires tool calls, which introduce roughly 100–500 ms of latency according to the source, instead of accessing information already inside the context.
+
+
+The agent's working memory now contains only the files that are currently open, rather than the entire workspace.
+
+The important change is that the unit of admission becomes a file. Earlier, the question was `“Which conversation turns should I summarize or remove?”` Here, the question becomes `“Which files should remain open?”` If the agent needs another file, it can close one currently open file and open the new one. It can also inspect only the symbols or relevant portions of a file instead of loading everything. File relevance is generally easier to rank than the relevance of individual conversation turns.
+
+
+### Pattern for Long-Running Coding Agents
+
+The complete pattern has four main pieces. **First, the workspace directory** is the durable state. Code and other artifacts remain there even if the agent session crashes, so a later session can resume by reading the relevant files again.
+
+**Second, the open-file** set acts as working memory. Only a bounded number of files are kept in the LLM's active context. Instead of summarizing files when the context gets full, the agent closes less-relevant files and can reopen them later with their full contents.
+
+**Third, the task plan is stored as a file**, such as PLAN.md or .agent/plan.md. The agent reads this plan when starting the session, updates it as work progresses, and writes the updated version back to disk. This externalizes the task's progress instead of requiring the model to remember the entire plan inside its context.
+
+**Fourth, scratch notes** can be stored in something like .agent/notes.md. These are temporary observations that the agent wants to preserve during the task without filling the conversational context. The agent can reread them whenever necessary.
+
+Together, these four pieces make the session durable and resumable. If the session crashes, the next session can read the workspace, plan, and notes and continue from the existing state. The key idea is that durability comes naturally from using the file system as the persistent state.
+
+
