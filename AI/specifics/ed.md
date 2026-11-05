@@ -1786,3 +1786,41 @@ The complete pattern has four main pieces. **First, the workspace directory** is
 Together, these four pieces make the session durable and resumable. If the session crashes, the next session can read the workspace, plan, and notes and continue from the existing state. The key idea is that durability comes naturally from using the file system as the persistent state.
 
 
+
+### Checkpoint and Resume
+
+**1. Durable State Log:** A durable state log records every important state transition made by the agent. Instead of keeping progress only in memory, every event is appended to persistent storage, such as a database table, append-only file, or event stream.
+
+**2. Idempotency** means that `repeating the same operation does not produce the same side effect multiple times`. Each agent step is assigned a key using values such as session_id, step_n, and content_hash. The content hash is generally calculated using the tool name and its canonical JSON arguments.
+
+**3. Replay-from-checkpoint** means that when an agent restarts, it resumes from the latest completed step instead of starting from the beginning.
+
+### Why Is Idempotency the Load-Bearing Word?
+Idempotency is especially important when an agent performs operations that create external side effects. Consider a payment operation such as transfer_funds($1000, account_X). If the request succeeds but the network connection fails before the agent receives the response, the agent might assume the operation failed and retry it. This could result in the same transfer being executed twice.
+
+The solution is to use an idempotency token, such as request_id. The agent passes this token to the tool, and the side-effecting service guarantees that multiple requests with the same token execute the operation only once.
+
+Therefore, the agent should not blindly retry a side-effecting operation. The tool or underlying service must provide idempotency protection. This is particularly important for payment-related operations.
+
+### How Does Crash Recovery Actually Run?
+Consider a coding agent that crashes at step 23 out of 40 while executing edit_file on payments.py.
+
+`First`, the process restarts. The runtime checks the durable state log to find a session that has not reached a terminal state. It identifies the incomplete session and prepares to recover it.
+
+`Second`, the runtime replays the completed steps. It reads steps 1 through 22 and reconstructs the agent's working state, including previously opened files, planned actions, and scratchpad notes. No new LLM calls are required for this reconstruction because the required information is already stored in the log.
+
+`Third`, the runtime inspects step 23. Since the crash happened during edit_file, the system needs to determine whether the operation was completed, partially applied, or not applied.
+
+There are three possible situations:
+- **Side effect already completed**: If the file contents match the intended content, the runtime marks step 23 as completed and moves to step 24.
+
+- **Side effect partially applied**: If only part of the edit was applied, the runtime can reapply the intended structured diff or roll back if the partial state is unsafe.
+
+- **Non-idempotent and unverifiable operation**: If the operation cannot be safely verified, such as a payment without a read-back mechanism, the system should send it for human review through a HITL (Human-in-the-Loop) gate rather than automatically replaying it.
+
+
+`Finally`, the agent resumes. The next LLM call receives a consistent state indicating that step 23 has been completed and that it should continue with step 24.
+
+
+
+> 💡Human-in-the-loop should be asynchronous by default. I would implement four review gates: destructive actions, low-confidence routing, budget thresholds, and explicit user checkpoints. Whenever a gate is triggered, the agent durably records the pending decision and transitions into awaiting-human, freeing its runtime resources. The decision goes into a review queue with per-gate SLAs. Reviewers can approve, modify, reject, or escalate the action. If the SLA expires, the system defaults to rejection rather than approval. Once a decision arrives, the agent resumes through the checkpoint mechanism.
